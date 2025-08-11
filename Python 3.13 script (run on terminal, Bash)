@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+# AlphaFlash Crypto (lite): fresh RSS → sentiment → live-priced trades
+# - One open position per ticker
+# - Quiet RSS logs + heartbeat: prints only when new items OR "searching for fresh data..."
+# - Strict max_age, UTC-safe timestamps, whitelist, cooldown
+# - Live Binance REST prices for entries/exits
+
+import asyncio
+import aiohttp
+import feedparser
+import time
+import argparse
+import ssl
+import certifi
+import calendar
+from datetime import datetime, timezone
+from typing import List, Dict, Optional, Tuple
+from transformers import pipeline
+
+# ---------------- HTTP HEADERS (avoid stale CDN / blocked UA) ----------------
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+# ---------------- UTIL ----------------
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+def fmt_ts_hms(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S")
+
+def parse_args():
+    p = argparse.ArgumentParser(description="AlphaFlash Crypto (fresh RSS + one-open-per-ticker)")
+    p.add_argument("--tickers", nargs="+", required=True, help="Universe (e.g., BTCUSDT ETHUSDT SOLUSDT)")
+    p.add_argument("--rss", nargs="+", required=True, help="RSS feed URLs (quote in zsh)")
+    p.add_argument("--model", choices=["finbert", "roberta", "vader"], default="finbert")
+    p.add_argument("--minutes", type=int, default=30)
+    p.add_argument("--long_th", type=float, default=0.6)
+    p.add_argument("--short_th", type=float, default=-0.6)
+    p.add_argument("--min_abs_score", type=float, default=0.4)
+    p.add_argument("--cooldown", type=int, default=600, help="Per-title cooldown (seconds)")
+    p.add_argument("--whitelist", nargs="*", default=[], help="Allowed domains (optional)")
+    p.add_argument("--max_age", type=int, default=90, help="Max headline age in seconds")
+    p.add_argument("--hold_sec", type=int, default=60, help="Fixed holding period (seconds)")
+    p.add_argument("--capital", type=float, default=1_000_000.0)
+    p.add_argument("--alloc_pct", type=float, default=0.05)
+    p.add_argument("--poll_sec", type=float, default=5.0, help="RSS poll interval (seconds)")
+    return p.parse_args()
+
+# ---------------- SENTIMENT ----------------
+def load_model(name: str):
+    if name == "finbert":
+        return pipeline("text-classification", model="ProsusAI/finbert")
+    elif name == "roberta":
+        return pipeline("text-classification", model="cardiffnlp/twitter-roberta-base-sentiment-latest")
+    else:
+        from nltk.sentiment import SentimentIntensityAnalyzer
+        return SentimentIntensityAnalyzer()
+
+def classify(model, model_name: str, text: str) -> Tuple[str, float]:
+    if not text:
+        return ("NEU", 0.0)
+    if model_name == "vader":
+        s = model.polarity_scores(text)["compound"]
+        if s >= 0.05: return ("POS", s)
+        if s <= -0.05: return ("NEG", s)
+        return ("NEU", 0.0)
+    else:
+        out = model(text, truncation=True)[0]
+        lab = out["label"].lower()
+        sc = float(out["score"])
+        if "pos" in lab: return ("POS", +sc)
+        if "neg" in lab: return ("NEG", -sc)
+        return ("NEU", 0.0)
+
+# ---------------- SIMPLE SIM ----------------
+class Position:
+    def __init__(self, ticker: str, side: str, qty: float, price: float, title: str, src: str):
+        self.ticker = ticker
+        self.side = side      # "LONG" or "SHORT"
+        self.qty = qty
+        self.entry = price
+        self.title = title
+        self.src = src
+        self.entry_time = utcnow()
+
+class Simulator:
+    def __init__(self, capital: float):
+        self.capital = capital
+        self.cash = capital
+        self.positions: List[Position] = []
+        self.open_by_ticker: Dict[str, bool] = {}  # enforce one open per ticker
+
+    def has_open(self, ticker: str) -> bool:
+        return self.open_by_ticker.get(ticker, False)
+
+    def open_position(self, ticker: str, side: str, qty: float, price: float, title: str, src: str):
+        # one-open-per-ticker gate
+        if self.has_open(ticker):
+            return False
+        pos = Position(ticker, side, qty, price, title, src)
+        self.positions.append(pos)
+        self.open_by_ticker[ticker] = True
+        print(f"{fmt_ts_hms(time.time())} ENTRY  {side:<5} {ticker:<8} {qty:<10.4f} {price:<12.2f} {title[:60]:<60} {src}")
+        return True
+
+    async def close_expired(self, hold_sec: int, price_fetcher):
+        still: List[Position] = []
+        for pos in self.positions:
+            if (utcnow() - pos.entry_time).total_seconds() >= hold_sec:
+                px = await price_fetcher(pos.ticker)
+                if px is None:
+                    px = pos.entry
+                pnl = (px - pos.entry) * pos.qty if pos.side == "LONG" else (pos.entry - px) * pos.qty
+                pnl_pct = (pnl / (pos.entry * pos.qty)) * 100 if pos.entry > 0 else 0.0
+                print(f"{fmt_ts_hms(time.time())} EXIT   {pos.side:<5} {pos.ticker:<8} {pos.qty:<10.4f} {px:<12.2f} {pnl:<12.2f} {pnl_pct:<8.3f} {pos.title[:60]:<60} {pos.src}")
+                self.cash += pnl
+                self.open_by_ticker[pos.ticker] = False
+            else:
+                still.append(pos)
+        self.positions = still
+
+# ---------------- PRICES (Binance REST) ----------------
+async def fetch_price(session: aiohttp.ClientSession, symbol: str) -> Optional[float]:
+    try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}"
+        async with session.get(url, headers=HEADERS, ssl=ssl.create_default_context(cafile=certifi.where()), timeout=6) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            return float(data.get("price", 0.0)) or None
+    except Exception:
+        return None
+
+# ---------------- RSS ----------------
+def domain_of(link: str) -> str:
+    try:
+        return link.split("/")[2]
+    except Exception:
+        return ""
+
+def allowed(link: str, wl: List[str]) -> bool:
+    if not wl:
+        return True
+    d = domain_of(link).lower()
+    return any(d == w or d.endswith("." + w) for w in wl)
+
+def entry_age_seconds(entry) -> Optional[float]:
+    # Use UTC-safe calendar.timegm
+    p = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    if not p:
+        return None
+    ts = float(calendar.timegm(p))
+    return max(0.0, time.time() - ts)
+
+async def fetch_feed(session: aiohttp.ClientSession, url: str, whitelist: List[str], max_age: int):
+    try:
+        async with session.get(url, ssl=ssl.create_default_context(cafile=certifi.where()),
+                               headers=HEADERS, timeout=12) as resp:
+            raw = await resp.read()
+        feed = feedparser.parse(raw)
+        fresh = []
+        now = time.time()
+        for e in feed.entries:
+            link = getattr(e, "link", "") or ""
+            title = getattr(e, "title", "") or ""
+            if not link or not title:
+                continue
+            if not allowed(link, whitelist):
+                continue
+            age = entry_age_seconds(e)
+            if age is None or age > max_age:
+                continue
+            # drop future-dated or negative ages just in case
+            if age < 0.0:
+                continue
+            fresh.append(e)
+        return fresh
+    except Exception:
+        return []
+
+# ---------------- MAIN LOOP ----------------
+async def rss_loop(args, model, sim: Simulator):
+    timeout_at = time.time() + args.minutes * 60
+    seen_links: Dict[str, float] = {}  # link -> last seen ts (cooldown)
+    cooldown = float(args.cooldown)
+
+    async with aiohttp.ClientSession() as session:
+        print(f"{fmt_ts_hms(time.time())} INFO   Model={args.model} | Hold={args.hold_sec}s | Capital=${args.capital:,.0f}, Alloc={args.alloc_pct*100:.1f}%")
+        print(f"{fmt_ts_hms(time.time())} INFO   MaxAge={args.max_age}s | Cooldown={args.cooldown}s | Feeds={len(args.rss)} | WL={args.whitelist or 'ANY'}")
+
+        while time.time() < timeout_at:
+            any_new = False
+
+            # Pull each feed
+            for url in args.rss:
+                fresh = await fetch_feed(session, url, args.whitelist, args.max_age)
+
+                # Filter out links we've seen within cooldown window
+                now = time.time()
+                fresh_new = []
+                for e in fresh:
+                    link = getattr(e, "link", "")
+                    last = seen_links.get(link, 0.0)
+                    if (now - last) >= cooldown:
+                        fresh_new.append(e)
+                        seen_links[link] = now
+
+                # Only print when we *actually* have new fresh items
+                if fresh_new:
+                    any_new = True
+                    print(f"[RSS] {url} → {len(fresh_new)} fresh items")
+
+                # Process new fresh items
+                for e in fresh_new:
+                    title = getattr(e, "title", "")
+                    link = getattr(e, "link", "")
+                    label, score = classify(model, args.model, title)
+
+                    # CLASS (compact)
+                    print(f"{fmt_ts_hms(time.time())} CLASS  {label:<3} {','.join(args.tickers):<30} {score:+.3f}   {title[:60]:<60} {domain_of(link)}")
+
+                    # Signal generation
+                    side = None
+                    if abs(score) >= args.min_abs_score:
+                        if score >= args.long_th:
+                            side = "LONG"
+                        elif score <= args.short_th:
+                            side = "SHORT"
+
+                    if side:
+                        # Use first ticker from your universe (same as before)
+                        ticker = args.tickers[0].upper()
+                        px = await fetch_price(session, ticker)
+                        if px is None or px <= 0:
+                            continue
+                        notional = args.capital * args.alloc_pct
+                        qty = notional / px
+                        if qty > 0:
+                            sim.open_position(ticker, side, qty, px, title, domain_of(link))
+
+            # Close positions whose hold time elapsed (uses live price at exit)
+            await sim.close_expired(args.hold_sec, lambda t: fetch_price(session, t))
+
+            # Heartbeat when there were no new fresh items this cycle
+            if not any_new:
+                print("[RSS] searching for fresh data...")
+
+            await asyncio.sleep(max(0.5, float(args.poll_sec)))
+
+    print(f"{fmt_ts_hms(time.time())} INFO   Session ended (timeout).")
+
+# ---------------- ENTRY ----------------
+async def main():
+    args = parse_args()
+    model = load_model(args.model)
+    sim = Simulator(args.capital)
+    await rss_loop(args, model, sim)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+
+
+
+
+
+-----------Bash script for Terminal------------
+
+source .venv/bin/activate && \
+cd "/Users/williamnelson/Desktop/Bristol Univeristy/Python Audit-Ready Workbook" && \
+python3 "Crypto NLP (microsecond execution).py" \
+  --tickers BTCUSDT ETHUSDT SOLUSDT \
+  --rss 'https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml' \
+       'https://cointelegraph.com/rss' \
+       'https://decrypt.co/feed' \
+       'https://cryptoslate.com/feed/' \
+       'https://bitcoinmagazine.com/.rss/full/' \
+       'https://www.theblock.co/rss' \
+       'https://news.google.com/rss/search?q=bitcoin+OR+ethereum&hl=en-US&gl=US&ceid=US:en' \
+       'https://news.google.com/rss/search?q=crypto+OR+blockchain&hl=en-US&gl=US&ceid=US:en' \
+  --whitelist coindesk.com cointelegraph.com decrypt.co cryptoslate.com bitcoinmagazine.com theblock.co news.google.com \
+  --max_age 180 --hold_sec 60 --capital 1000000 --alloc_pct 0.05 \
+  --model finbert --minutes 30 \
+  --long_th 0.6 --short_th -0.6 --min_abs_score 0.4 --cooldown 120 --poll_sec 3
